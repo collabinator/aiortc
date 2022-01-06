@@ -3,12 +3,15 @@ import asyncio
 import json
 import logging
 import os
+import re
 import ssl
 import uuid
 
 import cv2
 from aiohttp import web
 from av import VideoFrame
+
+from video_to_ascii import video_engine
 
 from aiortc import MediaStreamTrack, RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaBlackhole, MediaPlayer, MediaRecorder, MediaRelay
@@ -34,6 +37,9 @@ class VideoTransformTrack(MediaStreamTrack):
 
     async def recv(self):
         frame = await self.track.recv()
+
+        ve = video_engine.VideoEngine("just-ascii")
+        ve.render_strategy.render_frame(frame.to_ndarray(format="bgr24"))
 
         if self.transform == "cartoon":
             img = frame.to_ndarray(format="bgr24")
@@ -169,7 +175,6 @@ async def offer(request):
             {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
         ),
     )
-
 
 async def on_shutdown(app):
     # close peer connections

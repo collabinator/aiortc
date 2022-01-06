@@ -3,7 +3,7 @@ Audio, video and data channel server
 
 This example illustrates establishing audio, video and a data channel with a
 browser. It also performs some image processing on the video frames using
-OpenCV.
+OpenCV and outputs them to the terminal in ASCII format using `video-to-ascii https://github.com/collabinator/video-to-ascii`.
 
 Running
 -------
@@ -12,7 +12,7 @@ First install the required packages:
 
 .. code-block:: console
 
-    $ pip install aiohttp aiortc opencv-python
+    $ pip install aiohttp aiortc opencv-python git+https://github.com/collabinator/video-to-ascii.git
 
 When you start the example, it will create an HTTP server which you
 can connect to from your browser:
