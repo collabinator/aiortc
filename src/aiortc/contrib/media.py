@@ -82,16 +82,23 @@ class MediaBlackhole:
 
 
 def player_worker(
-    loop, container, streams, audio_track, video_track, quit_event, throttle_playback
+    loop,
+    container,
+    streams,
+    audio_track,
+    video_track,
+    quit_event,
+    throttle_playback,
+    loop_playback,
 ):
-    audio_fifo = av.AudioFifo()
-    audio_format_name = "s16"
-    audio_layout_name = "stereo"
     audio_sample_rate = 48000
     audio_samples = 0
-    audio_samples_per_frame = int(audio_sample_rate * AUDIO_PTIME)
+    audio_time_base = fractions.Fraction(1, audio_sample_rate)
     audio_resampler = av.AudioResampler(
-        format=audio_format_name, layout=audio_layout_name, rate=audio_sample_rate
+        format="s16",
+        layout="stereo",
+        rate=audio_sample_rate,
+        frame_size=int(audio_sample_rate * AUDIO_PTIME),
     )
 
     video_first_pts = None
@@ -106,6 +113,9 @@ def player_worker(
             if isinstance(exc, av.FFmpegError) and exc.errno == errno.EAGAIN:
                 time.sleep(0.01)
                 continue
+            if isinstance(exc, StopIteration) and loop_playback:
+                container.seek(0)
+                continue
             if audio_track:
                 asyncio.run_coroutine_threadsafe(audio_track._queue.put(None), loop)
             if video_track:
@@ -119,29 +129,14 @@ def player_worker(
                 time.sleep(0.1)
 
         if isinstance(frame, AudioFrame) and audio_track:
-            if (
-                frame.format.name != audio_format_name
-                or frame.layout.name != audio_layout_name
-                or frame.sample_rate != audio_sample_rate
-            ):
-                frame.pts = None
-                frame = audio_resampler.resample(frame)
+            for frame in audio_resampler.resample(frame):
+                # fix timestamps
+                frame.pts = audio_samples
+                frame.time_base = audio_time_base
+                audio_samples += frame.samples
 
-            # fix timestamps
-            frame.pts = audio_samples
-            frame.time_base = fractions.Fraction(1, audio_sample_rate)
-            audio_samples += frame.samples
-
-            audio_fifo.write(frame)
-            while True:
-                frame = audio_fifo.read(audio_samples_per_frame)
-                if frame:
-                    frame_time = frame.time
-                    asyncio.run_coroutine_threadsafe(
-                        audio_track._queue.put(frame), loop
-                    )
-                else:
-                    break
+                frame_time = frame.time
+                asyncio.run_coroutine_threadsafe(audio_track._queue.put(frame), loop)
         elif isinstance(frame, VideoFrame) and video_track:
             if frame.pts is None:  # pragma: no cover
                 logger.warning(
@@ -232,9 +227,10 @@ class MediaPlayer:
     :param file: The path to a file, or a file-like object.
     :param format: The format to use, defaults to autodect.
     :param options: Additional options to pass to FFmpeg.
+    :param loop: Whether to repeat playback indefinitely (requires a seekable file).
     """
 
-    def __init__(self, file, format=None, options={}):
+    def __init__(self, file, format=None, options={}, loop=False):
         self.__container = av.open(file=file, format=format, mode="r", options=options)
         self.__thread: Optional[threading.Thread] = None
         self.__thread_quit: Optional[threading.Event] = None
@@ -255,6 +251,12 @@ class MediaPlayer:
         # check whether we need to throttle playback
         container_format = set(self.__container.format.name.split(","))
         self._throttle_playback = not container_format.intersection(REAL_TIME_FORMATS)
+
+        # check whether the looping is supported
+        assert (
+            not loop or self.__container.duration is not None
+        ), "The `loop` argument requires a seekable file"
+        self._loop_playback = loop
 
     @property
     def audio(self) -> MediaStreamTrack:
@@ -286,6 +288,7 @@ class MediaPlayer:
                     self.__video,
                     self.__thread_quit,
                     self._throttle_playback,
+                    self._loop_playback,
                 ),
             )
             self.__thread.start()
@@ -309,6 +312,7 @@ class MediaPlayer:
 
 class MediaRecorderContext:
     def __init__(self, stream):
+        self.started = False
         self.stream = stream
         self.task = None
 
@@ -384,34 +388,57 @@ class MediaRecorder:
                 self.__container.close()
                 self.__container = None
 
-    async def __run_track(self, track, context):
+    async def __run_track(self, track: MediaStreamTrack, context: MediaRecorderContext):
         while True:
             try:
                 frame = await track.recv()
             except MediaStreamError:
                 return
+
+            if not context.started:
+                # adjust the output size to match the first frame
+                if isinstance(frame, VideoFrame):
+                    context.stream.width = frame.width
+                    context.stream.height = frame.height
+                context.started = True
+
             for packet in context.stream.encode(frame):
                 self.__container.mux(packet)
 
 
 class RelayStreamTrack(MediaStreamTrack):
-    def __init__(self, relay, source: MediaStreamTrack) -> None:
+    def __init__(self, relay, source: MediaStreamTrack, buffered) -> None:
         super().__init__()
         self.kind = source.kind
         self._relay = relay
-        self._queue: asyncio.Queue[Optional[Frame]] = asyncio.Queue()
         self._source: Optional[MediaStreamTrack] = source
+        self._buffered = buffered
+
+        self._frame: Optional[Frame] = None
+        self._queue: Optional[asyncio.Queue[Optional[Frame]]] = None
+        self._new_frame_event: Optional[asyncio.Event] = None
+
+        if self._buffered:
+            self._queue = asyncio.Queue()
+        else:
+            self._new_frame_event = asyncio.Event()
 
     async def recv(self):
         if self.readyState != "live":
             raise MediaStreamError
 
         self._relay._start(self)
-        frame = await self._queue.get()
-        if frame is None:
+
+        if self._buffered:
+            self._frame = await self._queue.get()
+        else:
+            await self._new_frame_event.wait()
+            self._new_frame_event.clear()
+
+        if self._frame is None:
             self.stop()
             raise MediaStreamError
-        return frame
+        return self._frame
 
     def stop(self):
         super().stop()
@@ -433,11 +460,18 @@ class MediaRelay:
         self.__proxies: Dict[MediaStreamTrack, Set[RelayStreamTrack]] = {}
         self.__tasks: Dict[MediaStreamTrack, asyncio.Future[None]] = {}
 
-    def subscribe(self, track: MediaStreamTrack) -> MediaStreamTrack:
+    def subscribe(
+        self, track: MediaStreamTrack, buffered: bool = True
+    ) -> MediaStreamTrack:
         """
         Create a proxy around the given `track` for a new consumer.
+
+        :param track: Source :class:`MediaStreamTrack` which is relayed
+        :param buffered: Whether there need a buffer between the source track and relayed track
+
+        :rtype: :class: MediaStreamTrack
         """
-        proxy = RelayStreamTrack(self, track)
+        proxy = RelayStreamTrack(self, track, buffered)
         self.__log_debug("Create proxy %s for source %s", id(proxy), id(track))
         if track not in self.__proxies:
             self.__proxies[track] = set()
@@ -474,7 +508,11 @@ class MediaRelay:
             except MediaStreamError:
                 frame = None
             for proxy in self.__proxies[track]:
-                proxy._queue.put_nowait(frame)
+                if proxy._buffered:
+                    proxy._queue.put_nowait(frame)
+                else:
+                    proxy._frame = frame
+                    proxy._new_frame_event.set()
             if frame is None:
                 break
 
